@@ -144,15 +144,11 @@ def fmt_money(value: Decimal | None) -> str:
 
 
 def fmt_rate(value: Decimal | None) -> str:
-    if value is None:
-        return ""
-    return format(value, "f").rstrip("0").rstrip(".")
+    return fmt_decimal(value)
 
 
 def fmt_calculated(value: Decimal | None) -> str:
-    if value is None:
-        return ""
-    return format(value, "f").rstrip("0").rstrip(".")
+    return fmt_decimal(value)
 
 
 def fixed(value: Decimal | str, places: int) -> str:
@@ -596,10 +592,26 @@ def parse_pdf_rsu_activity(text: str) -> dict[str, str]:
     grant_pattern = re.compile(r"\d{4}-[A-Za-z0-9-]+-RSU")
     for index, raw_line in enumerate(block):
         line = raw_line.strip()
+        # The supported wrapped layout is parsed from its Release line below.
+        # Count that record once rather than also flagging its quantity line.
+        if (
+            index + 2 < len(block)
+            and block[index + 1].strip() == "RSU"
+            and block[index + 2].strip() == "Release"
+        ):
+            continue
+        # Detect movements more broadly than we parse them. An unfamiliar grant
+        # name or inline release ID must fail validation, not look like no activity.
+        # A minus sign within a grant name (e.g. 2024-1-QEG-RSU) is not a quantity.
+        has_negative_quantity = re.search(r"(?:^|\s)-\d", line) is not None
+        # Preserve detection of adjacent signed quantities in the known layout.
         grant_match = grant_pattern.search(line)
-        values = re.findall(NUMBER_RE, line[: grant_match.start()]) if grant_match else []
-        has_negative_quantity = any(parse_decimal(value) < 0 for value in values)
-        if re.search(r"Release\s*$", line) or has_negative_quantity:
+        if grant_match:
+            has_negative_quantity |= any(
+                parse_decimal(value) < 0
+                for value in re.findall(NUMBER_RE, line[: grant_match.start()])
+            )
+        if re.search(r"Release\b", line, re.IGNORECASE) or has_negative_quantity:
             candidate_indexes.append(index)
     events: list[dict[str, str]] = []
     malformed: list[str] = []

@@ -1,13 +1,21 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["pypdf"]
+# ///
+
 import argparse
 import copy
 import csv
 import io
+import sys
 import tempfile
 import unittest
 import urllib.error
 from decimal import Decimal
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src import extract_shareworks_statement as extractor
 
@@ -444,9 +452,52 @@ class ActivityReconciliationTests(unittest.TestCase):
             with self.subTest(text=broken_text):
                 result = extractor.parse_pdf_rsu_activity(broken_text)
 
-                self.assertEqual(result["rsu_activity_candidate_count"], "1")
+                self.assertGreaterEqual(int(result["rsu_activity_candidate_count"]), 1)
                 self.assertIn("unparseable", result["rsu_activity_status"])
                 self.assertEqual(extractor.decode_activity_events(result, "rsu_activity"), [])
+
+    def test_pdf_unknown_rsu_movement_layouts_are_blocking(self) -> None:
+        for release_text in [
+            "New Hire RSURelease (REL1)",
+            "New Hire RSU\nRelease (REL1)",
+            "New Hire RSUUnknown",
+            "New Hire RSUrelease (REL1)",
+        ]:
+            with self.subTest(release_text=release_text):
+                text = PDF_ACTIVITY_TEXT.replace("2024-1-QEG-RSURelease", release_text)
+                result = extractor.parse_pdf_rsu_activity(text)
+
+                self.assertGreaterEqual(int(result["rsu_activity_candidate_count"]), 1)
+                self.assertIn("unparseable", result["rsu_activity_status"])
+                self.assertEqual(extractor.decode_activity_events(result, "rsu_activity"), [])
+
+    def test_pdf_inline_release_label_is_detected_without_negative_quantity(self) -> None:
+        text = PDF_ACTIVITY_TEXT.replace(
+            "2024-1-QEG-RSURelease", "New Hire RSURelease (REL1)"
+        ).replace("-2.000000", "2.000000")
+        result = extractor.parse_pdf_rsu_activity(text)
+
+        self.assertEqual(result["rsu_activity_candidate_count"], "1")
+        self.assertIn("unparseable", result["rsu_activity_status"])
+
+    def test_pdf_grants_without_releases_are_not_negative_movements(self) -> None:
+        text = PDF_ACTIVITY_TEXT.replace(
+            "2024-1-QEG-RSURelease\n(REL1)", "2024-1-QEG-RSUGrant"
+        ).replace("-2.000000", "2.000000")
+        result = extractor.parse_pdf_rsu_activity(text)
+
+        self.assertEqual(result["rsu_activity_candidate_count"], "0")
+        self.assertEqual(result["rsu_activity_status"], "ok")
+
+    def test_pdf_concatenated_negative_quantities_are_still_detected(self) -> None:
+        text = PDF_ACTIVITY_TEXT.replace(
+            "-2.000000 -2.000000-2.000000 -2.0000002024-1-QEG-RSURelease",
+            "0.000000-2.0000002024-1-QEG-RSUUnknown",
+        )
+        result = extractor.parse_pdf_rsu_activity(text)
+
+        self.assertEqual(result["rsu_activity_candidate_count"], "1")
+        self.assertIn("unparseable", result["rsu_activity_status"])
 
     def test_offsetting_activity_still_requires_detail_sections(self) -> None:
         result = extractor.build_activity_reconciliation(self.activity_metadata(), [])
@@ -629,6 +680,47 @@ class HoldingReconciliationTests(unittest.TestCase):
 
 
 class MainFailClosedTests(unittest.TestCase):
+    def test_unrecognized_zero_net_release_blocks_ready_output(self) -> None:
+        text = PDF_ACTIVITY_TEXT.replace(
+            "2024-1-QEG-RSURelease\n(REL1)", "New Hire RSURelease (REL1)"
+        ).replace(
+            "$15.00 USD 1.500000 EmployeeRelease (REL1)02-Jan-2024\n"
+            "$-15.00 USD$10.00 USD-1.500000 EmployeeSale03-Jan-2024\n",
+            "",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            report = temp_path / "statement.pdf"
+            report.write_bytes(b"%PDF-1.4\n")
+            args = argparse.Namespace(
+                report=report,
+                cgt_symbol="EXMPL",
+                outputs_dir=temp_path / "outputs",
+                out=None,
+                work_dir=temp_path / "work",
+            )
+            page = Mock()
+            page.extract_text.return_value = text
+            with (
+                patch.object(extractor, "parse_args", return_value=args),
+                patch.object(extractor, "PdfReader") as reader,
+                patch.object(extractor, "apply_fx_rates") as apply_fx,
+                io.StringIO() as stdout,
+                patch("sys.stdout", stdout),
+            ):
+                reader.return_value.pages = [page]
+                return_code = extractor.main()
+                output = stdout.getvalue()
+
+            self.assertEqual(return_code, 1)
+            self.assertIn("cgt_ready=false", output)
+            self.assertIn("RSU Activity: unparseable", output)
+            apply_fx.assert_not_called()
+            with (args.outputs_dir / "shareworks_extracted_rows.csv").open(newline="") as handle:
+                self.assertEqual(list(csv.DictReader(handle)), [])
+            audit_text = (args.outputs_dir / "shareworks_extraction_audit.csv").read_text()
+            self.assertIn("unparseable", audit_text)
+
     def run_main(
         self,
         temp_path: Path,
@@ -883,6 +975,59 @@ class MainFailClosedTests(unittest.TestCase):
                 self.assertEqual(output_rows[0][field_name], "")
             self.assertIn("FX enrichment", audit_text)
             self.assertIn("test FX outage", audit_text)
+
+
+class DecimalFormattingTests(unittest.TestCase):
+    def test_preserves_whole_number_zeros(self):
+        cases = {
+            "0": "0",
+            "10": "10",
+            "100": "100",
+            "-10": "-10",
+            "1E+3": "1000",
+            "10.000": "10",
+            "0.000": "0",
+            "1.2300": "1.23",
+            "0.0100": "0.01",
+            "0.79000": "0.79",
+        }
+        for formatter in (extractor.fmt_calculated, extractor.fmt_rate):
+            with self.subTest(formatter=formatter.__name__, value=None):
+                self.assertEqual(formatter(None), "")
+            for value, expected in cases.items():
+                with self.subTest(formatter=formatter.__name__, value=value):
+                    self.assertEqual(formatter(Decimal(value)), expected)
+
+    def test_derived_values_keep_totals_prices_and_fees(self):
+        rows = [
+            {
+                "Date": "2024-01-02",
+                "Type": transaction_type,
+                "Quantity": quantity,
+                "USD Price": "100",
+                "USD Fees": fees,
+                "FX Rate": "0.8",
+            }
+            for transaction_type, quantity, fees in [
+                ("Release", "100", ""),
+                ("Sell to Cover", "90", "25"),
+                ("Withdrawal", "10", "0"),
+            ]
+        ]
+
+        extractor.apply_derived_values(rows, symbol="SHOP")
+
+        self.assertEqual([row["Running total"] for row in rows], ["100", "10", "0"])
+        self.assertEqual([row["GBP Price"] for row in rows], ["80", "80", "80"])
+        self.assertEqual([row["GBP Fees"] for row in rows], ["0", "20", "0"])
+        self.assertEqual(
+            [row["CGT Calculator String"] for row in rows],
+            [
+                "B 02/01/2024 SHOP 100.000000 80.0000 0.00 0.00",
+                "S 02/01/2024 SHOP 90.000000 80.0000 20.00 0.00",
+                "S 02/01/2024 SHOP 10.000000 80.0000 0.00 0.00",
+            ],
+        )
 
 
 if __name__ == "__main__":

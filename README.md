@@ -159,11 +159,19 @@ An Activity-table opening market price or book value is not enough to reconstruc
 
 ## Tests
 
-Run the parser and fail-closed regression suite from the project root:
+Run the parser, fail-closed, and decimal-formatting regression tests from the project root:
+
+```bash
+uv run tests/test_extract_shareworks_statement.py
+```
+
+Or use unittest discovery:
 
 ```bash
 uv run --with pypdf python -m unittest discover -s tests -v
 ```
+
+These tests use synthetic statements and transactions and do not require network access once dependencies are installed.
 
 ## Dependencies
 
